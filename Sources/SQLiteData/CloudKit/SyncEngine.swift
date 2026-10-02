@@ -664,13 +664,48 @@
     }
 
     private func enqueueUnknownRecordsForCloudKit() async throws {
+      let unsavedRecordIDs = try await unsavedRecordIDs()
       try await userDatabase.write { db in
         try $_isSynchronizingChanges.withValue(false) {
           try SyncMetadata
             .where { !$0.hasLastKnownServerRecord }
             .update { $0.recordPrimaryKey = $0.recordPrimaryKey }
             .execute(db)
+          // NB: Batched to stay well under SQLite's bound parameter limit.
+          for start in stride(from: 0, to: unsavedRecordIDs.count, by: 500) {
+            try SyncMetadata
+              .findAll(unsavedRecordIDs[start..<min(start + 500, unsavedRecordIDs.count)])
+              .update { $0.recordPrimaryKey = $0.recordPrimaryKey }
+              .execute(db)
+          }
         }
+      }
+    }
+
+    /// Records that were sent to CloudKit but never saved there, for example because the user's
+    /// iCloud storage was full.
+    ///
+    /// A record is stored as its own last known server record when it is built for sending, so
+    /// unlike a record that was never sent it is not caught by `!hasLastKnownServerRecord`. Signing
+    /// in clears the sync engine's pending changes, so these records must be enqueued again.
+    private func unsavedRecordIDs() async throws -> [CKRecord.ID] {
+      try await metadatabase.read { db in
+        var recordIDs: [CKRecord.ID] = []
+        let rows = try SyncMetadata
+          .where { $0.hasLastKnownServerRecord && !$0._isDeleted }
+          .select { ($0.recordName, $0.zoneName, $0.ownerName, $0.lastKnownServerRecord) }
+          .fetchCursor(db)
+        while let (recordName, zoneName, ownerName, lastKnownServerRecord) = try rows.next() {
+          guard lastKnownServerRecord?.hasBeenSavedToServer != true
+          else { continue }
+          recordIDs.append(
+            CKRecord.ID(
+              recordName: recordName,
+              zoneID: CKRecordZone.ID(zoneName: zoneName, ownerName: ownerName)
+            )
+          )
+        }
+        return recordIDs
       }
     }
 
