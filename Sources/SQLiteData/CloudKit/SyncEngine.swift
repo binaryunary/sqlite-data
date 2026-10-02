@@ -1675,6 +1675,20 @@
         referencedBy: failedRecordSaves.filter { $0.error.code == .referenceViolation }
       )
       let failedRecordIDs = Set(failedRecordSaves.map(\.record.recordID))
+      // Records whose own failure below sends them again. A child rejected with a reference
+      // violation in the same batch as one of these parents must be sent again with it, or it
+      // is never uploaded once the parent is.
+      let retriedRecordIDs = Set(
+        failedRecordSaves.compactMap { record, error in
+          switch error.code {
+          case .serverRecordChanged where error.serverRecord != nil,
+            .zoneNotFound, .unknownItem, .batchRequestFailed, .quotaExceeded:
+            return record.recordID
+          default:
+            return nil
+          }
+        }
+      )
       for (failedRecord, error) in failedRecordSaves {
         func clearServerRecord() async {
           await withErrorReporting(.sqliteDataCloudKitFailure) {
@@ -1712,6 +1726,8 @@
           {
             if !failedRecordIDs.contains(parentRecordID) {
               newPendingRecordZoneChanges.append(.saveRecord(parentRecordID))
+              newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
+            } else if retriedRecordIDs.contains(parentRecordID) {
               newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
             }
             continue

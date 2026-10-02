@@ -529,6 +529,89 @@
         }
         #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
       }
+
+      // * Local client saves a list and a reminder while the user's iCloud storage is full.
+      // * List is rejected with `quotaExceeded`, and reminder is rejected with a reference
+      //   violation in the same batch.
+      // => Reminder is not deleted. Both records are sent again and uploaded once storage frees.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func listQuotaExceededInSameBatchAsReminderReferenceViolation() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Personal")
+            Reminder(id: 1, title: "Get milk", remindersListID: 1)
+          }
+        }
+        let batch = await syncEngine.nextRecordZoneChangeBatch(syncEngine: syncEngine.private)
+        let recordsToSave = try #require(batch?.recordsToSave)
+        let remindersListRecord = try #require(
+          recordsToSave.first { $0.recordID == RemindersList.recordID(for: 1) }
+        )
+        let reminderRecord = try #require(
+          recordsToSave.first { $0.recordID == Reminder.recordID(for: 1) }
+        )
+        syncEngine.private.state.remove(
+          pendingRecordZoneChanges: recordsToSave.map { .saveRecord($0.recordID) }
+        )
+        await syncEngine.handleEvent(
+          .sentRecordZoneChanges(
+            savedRecords: [],
+            failedRecordSaves: [
+              (record: remindersListRecord, error: CKError(.quotaExceeded)),
+              (record: reminderRecord, error: CKError(.referenceViolation)),
+            ],
+            deletedRecordIDs: [],
+            failedRecordDeletes: [:]
+          ),
+          syncEngine: syncEngine.private
+        )
+        try await userDatabase.read { db in
+          try #expect(RemindersList.all.fetchAll(db) == [RemindersList(id: 1, title: "Personal")])
+          try #expect(
+            Reminder.all.fetchAll(db) == [Reminder(id: 1, title: "Get milk", remindersListID: 1)]
+          )
+        }
+        #expect(
+          Set(syncEngine.private.state.pendingRecordZoneChanges) == [
+            .saveRecord(RemindersList.recordID(for: 1)),
+            .saveRecord(Reminder.recordID(for: 1)),
+          ]
+        )
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        assertInlineSnapshot(of: container, as: .customDump) {
+          """
+          MockCloudContainer(
+            privateCloudDatabase: MockCloudDatabase(
+              databaseScope: .private,
+              storage: [
+                [0]: CKRecord(
+                  recordID: CKRecord.ID(1:reminders/zone/__defaultOwner__),
+                  recordType: "reminders",
+                  parent: CKReference(recordID: CKRecord.ID(1:remindersLists/zone/__defaultOwner__)),
+                  share: nil,
+                  id: 1,
+                  isCompleted: 0,
+                  remindersListID: 1,
+                  title: "Get milk"
+                ),
+                [1]: CKRecord(
+                  recordID: CKRecord.ID(1:remindersLists/zone/__defaultOwner__),
+                  recordType: "remindersLists",
+                  parent: nil,
+                  share: nil,
+                  id: 1,
+                  title: "Personal"
+                )
+              ]
+            ),
+            sharedCloudDatabase: MockCloudDatabase(
+              databaseScope: .shared,
+              storage: []
+            )
+          )
+          """
+        }
+      }
     }
   }
 #endif
